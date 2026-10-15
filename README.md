@@ -26,8 +26,11 @@ No third-party install needed beyond `numpy` and `matplotlib` (already present).
 Tests use stdlib `unittest` (no pytest required):
 
 ```bash
-python3 -m unittest discover -s tests -t .     # ~17 s
+python3 -m unittest discover -s tests -t .     # ~27 s
 ```
+
+The suite drives the real Tk GUI when a display is available and skips itself
+when there isn't one, so it is safe to run headless.
 
 ---
 

@@ -100,6 +100,18 @@ class _Worker(threading.Thread):
                 self.jobs.task_done()
 
 
+def _plot_dt(duration: float, points: int = 1500) -> float:
+    """Step size for GUI plots.
+
+    The solver's auto step resolves the fastest *time constant*, which is the
+    right choice for accuracy but can be coarse for drawing: a 5 s window on a
+    2.5 s system is only ~100 samples.  The engines run at ~2M steps/s, so
+    asking for a fixed ~1500 points costs under a millisecond and makes the
+    curves smooth regardless of how slow the drivetrain is.
+    """
+    return max(float(duration) / float(points), 1e-7)
+
+
 class DriveApp:
     """Main application window."""
 
@@ -499,8 +511,8 @@ class DriveApp:
         kind = self.excite_var.get()
 
         def job():
-            v = voltage_signal(kind, system, duration)
-            res = simulate(system, v, duration, engine=engine)
+            v = voltage_signal(kind, system, duration, dt=_plot_dt(duration))
+            res = simulate(system, v, duration, dt=_plot_dt(duration), engine=engine)
             return system, res, kind
 
         self._start(f"simulating {self.preset_name} [{engine}] for {duration:g} s ...",
@@ -578,7 +590,6 @@ class DriveApp:
             for a in row:
                 a.grid(alpha=0.3)
                 a.set_xlabel("time [s]")
-        self.fig.tight_layout()
         self.canvas.draw_idle()
 
         self.metric_text.configure(state="normal")
@@ -631,7 +642,6 @@ class DriveApp:
         self.sweep_ax.set_title(
             f"{metric} vs {path}   "
             f"(best {float(best[metric]):.4g} at {path} = {float(best[path]):.4g})")
-        self.sweep_fig.tight_layout()
         self.sweep_canvas.draw_idle()
 
         self.sweep_out.configure(state="normal")
@@ -654,7 +664,8 @@ class DriveApp:
             out = []
             for name in names:
                 sys_ = presets.build(name)
-                out.append((name, simulate(sys_, sys_.voltage_limit, duration, engine=engine)))
+                out.append((name, simulate(sys_, sys_.voltage_limit, duration,
+                                           dt=_plot_dt(duration), engine=engine)))
             return out
 
         self._start(f"comparing {len(names)} presets ...", job,
@@ -668,7 +679,6 @@ class DriveApp:
         self.cmp_ax.set_xlabel("time [s]")
         self.cmp_ax.grid(alpha=0.3)
         self.cmp_ax.legend(fontsize=8, ncol=2)
-        self.cmp_fig.tight_layout()
         self.cmp_canvas.draw_idle()
         self.set_status(f"compared {len(rows)} presets on {qty}")
 

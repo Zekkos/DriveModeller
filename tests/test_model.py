@@ -267,5 +267,67 @@ class TestSweep(unittest.TestCase):
         self.assertEqual(out.load.wheel.radius, 0.09)
 
 
+class TestGUI(unittest.TestCase):
+    """Drives the real Tk app.  Skipped when there is no display."""
+
+    @classmethod
+    def setUpClass(cls):
+        import warnings
+
+        try:
+            import tkinter as tk
+            from matplotlib.figure import Figure  # noqa: F401
+        except Exception as exc:                       # pragma: no cover
+            raise unittest.SkipTest(f"matplotlib/tkinter unavailable: {exc}")
+        try:
+            root = tk.Tk()
+        except Exception as exc:
+            raise unittest.SkipTest(f"no display: {exc}")
+        root.withdraw()
+        cls.tk = tk
+        cls.root = root
+        cls.warnings = warnings
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.root.destroy()
+        except Exception:
+            pass    # a test already closed the app (that is a valid path)
+
+    def _pump(self, seconds):
+        import time
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            self.root.update()
+            time.sleep(0.02)
+
+    def test_app_builds_runs_and_edits(self):
+        from drivetrain.gui import DriveApp
+
+        with self.warnings.catch_warnings():
+            # constrained_layout is already on; any tight_layout() left in the
+            # GUI would raise here
+            self.warnings.simplefilter("error", UserWarning)
+            app = DriveApp(self.root, preset="pod_4x_geared")
+            self._pump(0.8)
+            self.assertTrue(app.sliders, "no parameter controls were built")
+            self.assertIsNotNone(app.last_result, "preset load did not simulate")
+            # plots must be smooth, not limited to the solver's auto step
+            self.assertGreater(len(app.last_result.t), 500)
+
+            app.sliders["gearbox.ratio"]["var"].set(0.08)
+            app._on_entry("gearbox.ratio")
+            self._pump(2.5)
+            self.assertTrue(np.all(np.isfinite(app.last_result.motor_speed)))
+
+            app.run_sweep()
+            self._pump(3.0)
+            app.run_compare()
+            self._pump(3.0)
+            app._on_close()
+            self.root.update()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
