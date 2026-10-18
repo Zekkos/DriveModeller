@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
@@ -15,6 +16,7 @@ from .exceptions import ConfigError
 from .gearbox import Gearbox, RatioConvention
 from .load import RotationalLoad, VehicleLoad, Wheel
 from .motor import MotorGroup, MotorModel
+from .pmsm import PMSMModel, PMSMSpec
 from .sweep import set_path
 from .system import DriveSystem
 
@@ -47,6 +49,20 @@ MOTORS: dict[str, MotorModel] = {
         kv=0.05, kt=0.05, resistance=0.5, rotor_inertia=1e-5,
         bearing_damping=0.0, max_voltage=12.0, max_current=float("inf"),
     ),
+    # Brushless machines.  These reach the brushed pipeline through the i_d=0
+    # collapse (kt = 1.5*p*lambda, kv = p*lambda, L = Lq), which is exact below
+    # the constant-torque band edge and cannot represent field weakening above
+    # it.  Use PMSMSpec directly, or export the dq model, past that edge.
+    "bldc_24v": PMSMModel(PMSMSpec(
+        resistance=0.12, inductance_d=1.5e-4, inductance_q=1.8e-4, flux_linkage=1.8e-3,
+        pole_pairs=7, rotor_inertia=2.0e-5, bearing_damping=1.0e-6,
+        current_limit=20.0, voltage_limit=24.0 / math.sqrt(3.0), dc_bus_voltage=24.0,
+    )),
+    "bldc_12v": PMSMModel(PMSMSpec(
+        resistance=0.35, inductance_d=6.0e-5, inductance_q=8.0e-5, flux_linkage=9.0e-4,
+        pole_pairs=10, rotor_inertia=4.0e-6, bearing_damping=2.0e-7,
+        current_limit=8.0, voltage_limit=12.0 / math.sqrt(3.0), dc_bus_voltage=12.0,
+    )),
 }
 
 WHEELS: dict[str, Wheel] = {
@@ -156,6 +172,19 @@ PRESETS: dict[str, Preset] = {
         ),
         tags=("rotational", "flywheel"),
     ),
+    "bldc_pod": Preset(
+        name="bldc_pod",
+        description="Brushless pod: 2 PMSMs, 6:1 reduction, 8 kg on 100 mm wheels, 24 V bus.",
+        system=DriveSystem(
+            group=MotorGroup(MOTORS["bldc_24v"].copy(), 2),
+            gearbox=Gearbox(ratio=0.167, efficiency=0.9, inertia=2e-5),
+            load=VehicleLoad(
+                mass=8.0, wheel=WHEELS["large"], wheels_driven=2,
+                rolling_resistance=0.02, drag_cd=0.5,
+            ),
+        ),
+        tags=("vehicle", "pod", "brushless"),
+    ),
 }
 
 
@@ -213,7 +242,10 @@ def to_dict(system: DriveSystem) -> dict[str, Any]:
     return {
         "group": {
             "count": system.group.count,
-            "motor": asdict(system.group.motor),
+            "motor": {
+                "kind": type(system.group.motor).__name__,
+                **asdict(system.group.motor),
+            },
         },
         "gearbox": asdict(system.gearbox),
         "load": {
@@ -246,23 +278,45 @@ def to_json(system: DriveSystem, indent: int = 2) -> str:
     return json.dumps(_inf_safe(to_dict(system)), indent=indent)
 
 
+def _clean(mapping: dict[str, Any]) -> dict[str, Any]:
+    """Undo the JSON encoding of ``None``/``inf``/``nan`` from :func:`_inf_safe`."""
+    out = {}
+    for k, v in mapping.items():
+        if v is None:
+            continue
+        if v == "inf":
+            v = float("inf")
+        elif v == "-inf":
+            v = float("-inf")
+        elif v == "nan":
+            v = float("nan")
+        out[k] = v
+    return out
+
+
+def _motor_from_dict(data: dict[str, Any]) -> Any:
+    """Rebuild a motor from its serialised form, dispatching on ``kind``.
+
+    A brushless machine is stored as ``{"kind": "PMSMModel", "spec": {...}}``:
+    the dq specification is the truth, and the brushed-looking ``kt``/``kv`` the
+    rest of the toolkit runs on are derived from it, so they are not stored and
+    cannot drift out of step with it.
+    """
+    kind = data.pop("kind", "MotorModel")
+    if kind == "MotorModel":
+        return MotorModel(**data)
+    if kind == "PMSMModel":
+        spec_data = _clean(data.pop("spec", {}))
+        return PMSMModel(spec=PMSMSpec(**spec_data), **data)
+    raise ConfigError(f"unknown motor kind {kind!r}; expected MotorModel or PMSMModel")
+
+
 def from_dict(data: dict[str, Any]) -> DriveSystem:
     """Rebuild a system from :func:`to_dict` output."""
-    def clean(mapping: dict[str, Any]) -> dict[str, Any]:
-        out = {}
-        for k, v in mapping.items():
-            if v is None:
-                continue
-            if v == "inf":
-                v = float("inf")
-            elif v == "-inf":
-                v = float("-inf")
-            elif v == "nan":
-                v = float("nan")
-            out[k] = v
-        return out
+    clean = _clean
 
-    motor = MotorModel(**clean(data["group"]["motor"]))
+    motor_data = clean(data["group"]["motor"])
+    motor = _motor_from_dict(motor_data)
     group = MotorGroup(motor, int(data["group"]["count"]))
     gb_data = clean(data["gearbox"])
     gb_data["convention"] = RatioConvention(gb_data.get("convention", "speed_ratio"))
@@ -310,6 +364,21 @@ PARAM_META: dict[str, dict[str, Any]] = {
     "group.motor.max_current":   {"label": "Current limit (each)", "unit": "A",      "min": 0.5,    "max": 200.0,  "step": 0.5,    "group": "Motor"},
     "group.motor.no_load_friction_current":{"label": "No-load friction current","unit": "A", "min": 0.0, "max": 2.0, "step": 0.01, "group": "Motor"},
     "group.motor.rot_vel":       {"label": "Initial speed",        "unit": "rad/s",  "min": -500.0, "max": 1500.0, "step": 5.0,    "group": "Motor"},
+    # brushless (dq spec) parameters - listed only when the motor is a PMSMModel
+    "group.motor.spec.resistance": {"label": "Phase resistance", "unit": "ohm", "min": 0.005, "max": 5.0, "step": 0.005, "group": "Motor (brushless)"},
+    "group.motor.spec.inductance_d": {"label": "d-axis inductance", "unit": "H", "min": 0.0, "max": 0.002, "step": 1e-6, "group": "Motor (brushless)"},
+    "group.motor.spec.inductance_q": {"label": "q-axis inductance", "unit": "H", "min": 0.0, "max": 0.002, "step": 1e-6, "group": "Motor (brushless)"},
+    "group.motor.spec.flux_linkage": {"label": "Magnet flux linkage", "unit": "Wb", "min": 0.0, "max": 0.02, "step": 1e-5, "group": "Motor (brushless)"},
+    "group.motor.spec.pole_pairs": {"label": "Pole pairs", "unit": "", "min": 1, "max": 30, "step": 1, "group": "Motor (brushless)"},
+    "group.motor.spec.current_limit": {"label": "Current limit (peak, each)", "unit": "A", "min": 0.5, "max": 200.0, "step": 0.5, "group": "Motor (brushless)"},
+    "group.motor.spec.voltage_limit": {"label": "Phase voltage limit (peak)", "unit": "V", "min": 1.0, "max": 100.0, "step": 0.5, "group": "Motor (brushless)"},
+    "group.motor.spec.dc_bus_voltage": {"label": "DC bus voltage", "unit": "V", "min": 1.0, "max": 100.0, "step": 0.5, "group": "Motor (brushless)"},
+    "group.motor.spec.rotor_inertia": {"label": "Rotor inertia", "unit": "kg*m^2", "min": 0.0, "max": 0.001, "step": 1e-6, "group": "Motor (brushless)"},
+    "group.motor.spec.bearing_damping": {"label": "Bearing damping", "unit": "N*m*s", "min": 0.0, "max": 0.001, "step": 1e-6, "group": "Motor (brushless)"},
+    "group.motor.spec.static_friction": {"label": "Static friction", "unit": "N*m", "min": 0.0, "max": 0.05, "step": 0.001, "group": "Motor (brushless)"},
+    "group.motor.spec.core_loss_coefficient": {"label": "Iron loss coefficient", "unit": "W/(rad/s elec)^2", "min": 0.0, "max": 1e-6, "step": 1e-10, "group": "Motor (brushless)"},
+    "group.motor.spec.windage_coefficient": {"label": "Windage coefficient", "unit": "W/(rad/s)^3", "min": 0.0, "max": 1e-6, "step": 1e-10, "group": "Motor (brushless)"},
+    "group.motor.spec.flux_temperature_coefficient": {"label": "Flux temp coefficient", "unit": "1/K", "min": -0.005, "max": 0.0, "step": 1e-5, "group": "Motor (brushless)"},
     # -- gearbox -------------------------------------------------------
     "gearbox.ratio":             {"label": "Gear ratio",           "unit": "out/in", "min": 0.02,   "max": 2.0,    "step": 0.005,  "group": "Gearbox"},
     "gearbox.efficiency":        {"label": "Gear efficiency",      "unit": "",       "min": 0.30,   "max": 1.0,    "step": 0.005,  "group": "Gearbox"},
@@ -391,6 +460,11 @@ def field_catalog(system: DriveSystem) -> list[dict[str, Any]]:
                 out.append(entry)
 
     add("group.motor", system.group.motor)
+    spec = getattr(system.group.motor, "spec", None)
+    if dataclasses.is_dataclass(spec):
+        # a brushless machine keeps its constants in a nested dq spec, which the
+        # dataclass filter below would otherwise skip entirely
+        add("group.motor.spec", spec)
     add("gearbox", system.gearbox)
     add("load", system.load)
     if hasattr(system.load, "wheel"):

@@ -7,11 +7,13 @@ Subcommands
 ``run``       time-domain simulation, text summary or CSV
 ``sweep``     parameter sweep with a metrics table
 ``optimize``  find the best value of one parameter for an objective
-``gui``       launch the interactive Tkinter/Matplotlib interface
+``fit``       fit a model to measured data, keeping known constants fixed
+``export``    emit the model as standalone C, Rust and Python for a controller
+``gui``       launch the interactive Qt/Matplotlib interface (via qtpy)
 ``validate``  cross-check the solvers against each other and the analytic model
 
-Common options ``--preset``, ``--set path=value`` and ``--json`` work everywhere,
-so any command can be scripted against an arbitrary configuration.
+Common options ``--preset``, ``--config``, ``--set path=value`` and ``--json`` work
+everywhere, so any command can be scripted against an arbitrary configuration.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ import numpy as np
 
 from . import presets
 from .exceptions import DrivetrainError
+from .fit import FREE_ALIASES, structural_inert
 from .motor import rad_s_to_rpm
 from .simulate import EXCITATIONS, simulate, voltage_signal
 from .sweep import find_gear_ratio, optimum, sweep, time_to_speed
@@ -58,8 +61,12 @@ def coerce(raw: str):
 
 
 def build_system(args) -> DriveSystem:
-    """Assemble a system from ``--preset`` plus ``--set`` overrides."""
-    system = presets.build(getattr(args, "preset", "legacy"))
+    """Assemble a system from ``--config`` and/or ``--preset`` plus ``--set`` overrides."""
+    config = getattr(args, "config", None)
+    if config:
+        system = presets.load(config)
+    else:
+        system = presets.build(getattr(args, "preset", "legacy"))
     overrides = parse_overrides(getattr(args, "set", None))
     for path, raw in overrides.items():
         system = _set(system, path, coerce(raw))
@@ -75,6 +82,14 @@ def build_system(args) -> DriveSystem:
             ratio=1.0 / system.gearbox.ratio,
             convention=RatioConvention.SPEED))
     return system
+
+
+def _source_label(args) -> str:
+    """Name the model a command started from, for headers."""
+    config = getattr(args, "config", None)
+    if config:
+        return f"model {config}"
+    return f"preset {getattr(args, 'preset', 'legacy')}"
 
 
 def _set(system: DriveSystem, path: str, value):
@@ -110,7 +125,7 @@ def cmd_describe(args) -> int:
         print(json.dumps(d, indent=2, default=str))
         return 0
     width = max(len(k) for k in d) + 1
-    print(f"preset: {args.preset}")
+    print(_source_label(args))
     for k, v in d.items():
         if isinstance(v, float) and not np.isfinite(v):
             v = "inf" if v > 0 else "-inf"
@@ -152,7 +167,7 @@ def cmd_run(args) -> int:
     m = result.metrics()
     p = result.peak()
     f = result.final()
-    print(f"{args.preset}  [{args.engine}, {args.excitation}, {args.duration:g} s]")
+    print(f"{_source_label(args)}  [{args.engine}, {args.excitation}, {args.duration:g} s]")
     print(f"  steady speed   {rad_s_to_rpm(system.steady_speed(system.voltage_limit)):9.1f} rpm"
           + (f"   {system.steady_ground_speed(system.voltage_limit) * 3.6:7.2f} km/h"
              if system.wheel else ""))
@@ -245,6 +260,111 @@ def cmd_optimize(args) -> int:
     return 0
 
 
+def _split_list(value):
+    """Flatten repeatable/comma-separated CLI lists into a list of tokens."""
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    out = []
+    for item in items:
+        out.extend(part.strip() for part in str(item).split(",") if part.strip())
+    return out
+
+
+def _key_value(items, flag, cast=float):
+    out = {}
+    for item in items or []:
+        if "=" not in item:
+            raise DrivetrainError(f"{flag} expects path=value, got {item!r}")
+        key, raw = item.split("=", 1)
+        try:
+            out[key.strip()] = cast(raw)
+        except ValueError:
+            raise DrivetrainError(f"{flag} expects a number for {key.strip()!r}, got {raw!r}")
+    return out
+
+
+def cmd_fit(args) -> int:
+    """Fit a model to measured data, with the constants you already know held fixed."""
+    from .fit import Dataset, FREE_ALIASES, fit as run_fit
+
+    if args.paths:
+        import math
+
+        from .fit import STATE_PATHS
+        from .sweep import get_path
+        system = build_system(args)
+        catalog = [row for row in presets.field_catalog(system)
+                   if row["path"] not in STATE_PATHS]
+        groups: dict[str, list[str]] = {}
+        for row in catalog:
+            groups.setdefault(row["group"], []).append(row["path"])
+        print("fittable parameter paths (this configuration):")
+        for group in ("Drivetrain", "Motor", "Gearbox", "Load", "Wheel", "Other"):
+            for path in groups.get(group, []):
+                value = get_path(system, path)
+                note = ""
+                if isinstance(value, float) and not math.isfinite(value):
+                    note = "   (no limit -- give it --known before fitting it)"
+                why = structural_inert(system, path)
+                if why:
+                    note = f"   ({why})"
+                print(f"  {path}{note}")
+        print("\nshorthand accepted by --free:")
+        for alias, paths in FREE_ALIASES.items():
+            print(f"  {alias:<12} {', '.join(paths)}")
+        return 0
+
+    if not args.dataset:
+        raise DrivetrainError("fit needs a dataset CSV (see --help), "
+                              "or --paths to list the parameter names)")
+
+    ds = Dataset.from_csv(args.dataset)
+    start = presets.load(args.config) if args.config else build_system(args)
+    free = _split_list(args.free) or "motor"
+    known = _key_value(args.known, "--known")
+    ties = _key_value(args.tie, "--tie", cast=str)
+    weights = _key_value(args.weight, "--weight")
+    bounds = {}
+    for item in args.bound or []:
+        if "=" not in item:
+            raise DrivetrainError(f"--bound expects path=min:max, got {item!r}")
+        key, raw = item.split("=", 1)
+        try:
+            lo, hi = raw.split(":", 1)
+            bounds[key.strip()] = (float(lo), float(hi))
+        except ValueError:
+            raise DrivetrainError(f"--bound expects path=min:max, got {item!r}")
+
+    # In --json mode stdout carries only the document, so chatter goes to stderr.
+    say = (lambda *a: None) if args.json else (lambda *a: print(*a))
+    say(f"dataset {args.dataset}: {ds.kind}, {len(ds.blocks)} block(s), "
+        f"channels {', '.join(ds.channels()) or 'none'}")
+    for note in ds.notes:
+        say(f"  note: {note}")
+
+    res = run_fit(
+        ds, system=start, free=free, known=known, ties=ties,
+        channels=_split_list(args.channel) or None, weights=weights or None,
+        engine=args.engine, dt=args.dt, voltage=args.voltage,
+        excitation=args.excitation, period=args.period, ramp_time=args.ramp,
+        log=not args.no_log, bounds=bounds or None, max_nfev=args.max_nfev,
+        verbose=args.verbose,
+    )
+
+    if args.json:
+        print(json.dumps(res.as_dict(), indent=2))
+    else:
+        print()
+        print(res.report())
+    if args.out:
+        res.save(args.out)
+        say(f"\nwrote fitted model to {args.out}")
+        say("load it with:  python3 -m drivetrain describe --config "
+            f"{args.out}   (or open it in the GUI)")
+    return 0 if res.success else 1
+
+
 def _validate_job(job):
     """Module level so it can be pickled to worker processes."""
     name, engine, duration, dt = job
@@ -316,7 +436,106 @@ def cmd_validate(args) -> int:
 def cmd_gui(args) -> int:
     from .gui import main as gui_main
 
-    return gui_main(["--preset", args.preset])
+    return gui_main(["--preset", args.preset, "--theme", args.theme])
+
+
+def cmd_export(args) -> int:
+    """Hand the model to the place it is used: C, Rust, Python, ROS 2."""
+    from .export import export as write_code, options_from_args, summarise
+
+    fit_doc = None
+    if args.fit_json:
+        # A fit result JSON carries the whole fitted model, so it can be the
+        # source directly: `fit --json > fit.json`, then `export --fit-json`.
+        import json
+        from pathlib import Path
+
+        from .export import system_from_fit_document
+
+        try:
+            fit_doc = json.loads(Path(args.fit_json).read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise DrivetrainError(f"cannot read --fit-json {args.fit_json}: {exc}")
+        system = system_from_fit_document(fit_doc)
+        for path, raw in parse_overrides(getattr(args, "set", None)).items():
+            system = _set(system, path, coerce(raw))
+        source = f"fit result {args.fit_json}"
+    else:
+        system = build_system(args)
+        source = _source_label(args)
+
+    options = options_from_args(args, source, fit_doc=fit_doc)
+    if getattr(args, "dq", False):
+        # the dq twin: same flags, but the machine keeps its d/q state instead
+        # of collapsing to a DC equivalent
+        from .export_dq import export_dq, summarise_dq
+
+        paths = export_dq(system, args.out, options)
+        if args.json:
+            import json
+
+            manifest = next(p for p in paths if p.suffix == ".json")
+            print(json.dumps(json.loads(manifest.read_text(encoding="utf-8")), indent=2))
+            return 0
+        summarise_dq(system, options, paths)
+        return 0
+    paths = write_code(system, args.out, options)
+    if args.json:
+        import json
+
+        manifest = next(p for p in paths if p.suffix == ".json")
+        print(json.dumps(json.loads(manifest.read_text(encoding="utf-8")), indent=2))
+        return 0
+    summarise(system, options, paths)
+    return 0
+
+
+def cmd_efficiency(args) -> int:
+    """Where the power actually goes, at one point or over a whole map."""
+    from .efficiency import efficiency_map, operating_point
+
+    system = build_system(args)
+    if args.map:
+        emap = efficiency_map(
+            system,
+            n_speeds=args.n_speeds,
+            n_torques=args.n_torques,
+            speed_top=args.speed_top,
+            torque_top=args.torque_top,
+            include_regen=not args.motoring_only,
+            torque_is=args.torque_is,
+            include_gearbox=args.include_gearbox,
+        )
+        if args.json:
+            import json
+
+            print(json.dumps(emap.as_dict(), indent=2))
+            return 0
+        print(emap.report())
+        if args.csv:
+            from pathlib import Path
+
+            path = emap.write_csv(Path(args.csv))
+            print(f"\nwrote {emap.shape[0] * emap.shape[1]} rows to {path}")
+        return 0
+
+    if args.speed is None or args.torque is None:
+        raise DrivetrainError(
+            "give --speed and --torque for one operating point, or --map for the "
+            "whole map (the speed axis is motor-side rad/s, the torque axis is "
+            "motor-side N*m)"
+        )
+    point = operating_point(
+        system, args.speed, args.torque,
+        torque_is=args.torque_is, include_gearbox=args.include_gearbox,
+    )
+    if args.json:
+        import json
+
+        print(json.dumps(point.as_dict(), indent=2))
+        return 0
+    print(point.report())
+    return 0
 
 
 # ----------------------------------------------------------------------
@@ -332,6 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def common(p, with_set=True):
         p.add_argument("--preset", default="legacy", choices=presets.preset_names())
+        p.add_argument("--config", help="start from a saved model JSON instead of a preset")
         if with_set:
             p.add_argument("--set", "-s", action="append", metavar="PATH=VALUE",
                            help="override any nested parameter, repeatable")
@@ -388,6 +608,100 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--engine", default="exact", choices=("exact", "rk4", "euler"))
     p.set_defaults(func=cmd_optimize)
 
+    p = sub.add_parser(
+        "fit", help="fit a model to measured data, keeping known constants fixed")
+    p.add_argument("dataset", nargs="?", help="CSV of measured data (see docs/fitting.md)")
+    p.add_argument("--preset", default="legacy", choices=presets.preset_names(),
+                   help="starting model (default legacy)")
+    p.add_argument("--config", help="start from a saved model JSON instead of a preset")
+    p.add_argument("--set", "-s", action="append", metavar="PATH=VALUE",
+                   help="override any parameter of the starting model, repeatable")
+    p.add_argument("--free", "-f", action="append", metavar="PATH|GROUP",
+                   help="parameters the fit may move: dotted paths or a group name ("
+                        + ", ".join(FREE_ALIASES) + ", all); default motor")
+    p.add_argument("--known", "-k", action="append", metavar="PATH=VALUE",
+                   help="pin a parameter to a constant you have measured, repeatable")
+    p.add_argument("--tie", action="append", metavar="TARGET=SOURCE",
+                   help="copy one fitted value onto another path, e.g. "
+                        "group.motor.kt=group.motor.kv")
+    p.add_argument("--channel", action="append", metavar="NAME",
+                   help="restrict the comparison to these data channels, repeatable")
+    p.add_argument("--weight", action="append", metavar="CHANNEL=SIGMA",
+                   help="1-sigma noise per channel (default: measured from the "
+                        "high-frequency scatter of the log itself)")
+    p.add_argument("--bound", action="append", metavar="PATH=MIN:MAX",
+                   help="override the search range of one parameter (catalogue ranges "
+                        "are already widened x100 at each end)")
+    p.add_argument("--voltage", type=float, default=None,
+                   help="drive level when the dataset has no voltage_V column")
+    p.add_argument("--excitation", default="step", choices=EXCITATIONS,
+                   help="prescribed input shape when voltage_V is missing")
+    p.add_argument("--period", type=float, default=None, help="square/alternating period")
+    p.add_argument("--ramp", type=float, default=None, help="ramp rise time")
+    p.add_argument("--engine", default="exact", choices=("exact", "rk4", "euler"))
+    p.add_argument("--dt", type=float, default=None, help="solver step (auto if omitted)")
+    p.add_argument("--max-nfev", type=int, default=400, help="optimiser evaluation budget")
+    p.add_argument("--no-log", action="store_true",
+                   help="optimise the raw values instead of their logarithms")
+    p.add_argument("--out", "-o", help="write the fitted model to this JSON file")
+    p.add_argument("--paths", action="store_true",
+                   help="list the parameter paths and group names, then exit")
+    p.add_argument("--verbose", "-v", action="store_true", help="optimiser progress")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=cmd_fit)
+
+    p = sub.add_parser("export", help="emit the model as standalone C / Rust / Python code")
+    p.add_argument("--preset", default="legacy", choices=presets.preset_names())
+    p.add_argument("--config", help="start from a saved model JSON instead of a preset "
+                                    "(e.g. the file written by `fit --out`)")
+    p.add_argument("--set", "-s", action="append", metavar="PATH=VALUE",
+                   help="override any nested parameter before exporting, repeatable")
+    p.add_argument("--fit-json", metavar="FILE",
+                   help="export the model inside a `fit --json` document, and carry its "
+                        "provenance and warnings into the generated comments")
+    p.add_argument("--out", "-o", default="build/export",
+                   help="directory for the generated code")
+    p.add_argument("--targets", "-t", default="c,rust,python",
+                   help="comma-separated: c, rust, python, ros")
+    p.add_argument("--dq", action="store_true",
+                   help="export the dq/FOC model of a brushless machine (Python only "
+                        "today) instead of the i_d=0 DC equivalent")
+    p.add_argument("--dtype", default="f32", choices=("f32", "f64"),
+                   help="float width for the generated C/Rust")
+    p.add_argument("--sample-time", type=float, default=None, metavar="S",
+                   help="the control period the code is sized for")
+    p.add_argument("--name", default="drive_model",
+                   help="module/file name and C symbol prefix base")
+    p.add_argument("--prefix", default="dt", help="C symbol prefix")
+    p.add_argument("--no-examples", action="store_true",
+                   help="skip the runnable step-response benches")
+    p.add_argument("--json", action="store_true", help="print the manifest instead of the summary")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser(
+        "efficiency", help="loss split at an operating point, or an efficiency map")
+    common(p)
+    p.add_argument("--speed", type=float, default=None,
+                   help="motor-shaft speed [rad/s] for a single operating point")
+    p.add_argument("--torque", type=float, default=None,
+                   help="motor-shaft torque [N*m] for a single operating point")
+    p.add_argument("--map", action="store_true",
+                   help="bill the whole (speed, torque) plane instead of one point")
+    p.add_argument("--n-speeds", type=int, default=33, help="speed rows for --map")
+    p.add_argument("--n-torques", type=int, default=25, help="torque columns for --map")
+    p.add_argument("--speed-top", type=float, default=None,
+                   help="top motor speed [rad/s] for --map (auto by default)")
+    p.add_argument("--torque-top", type=float, default=None,
+                   help="torque magnitude at the top of the axis [N*m] (auto by default)")
+    p.add_argument("--motoring-only", action="store_true",
+                   help="drop the braking half of the torque axis from --map")
+    p.add_argument("--torque-is", default="developed", choices=("developed", "shaft"),
+                   help="whether the torque axis is electromagnetic or delivered")
+    p.add_argument("--include-gearbox", action="store_true",
+                   help="bill the gear stage's losses in the split")
+    p.add_argument("--csv", help="with --map, write the grid to this CSV file")
+    p.set_defaults(func=cmd_efficiency)
+
     p = sub.add_parser("validate", help="cross-check engines vs analytic model")
     p.add_argument("--presets", nargs="*", default=None)
     p.add_argument("--duration", type=float, default=40.0)
@@ -399,6 +713,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("gui", help="launch the interactive interface")
     p.add_argument("--preset", default="legacy", choices=presets.preset_names())
+    p.add_argument("--theme", default="gruvbox", choices=("gruvbox", "system"),
+                   help="widget and chart colour scheme")
     p.set_defaults(func=cmd_gui)
 
     return ap

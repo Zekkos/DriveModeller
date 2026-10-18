@@ -25,7 +25,7 @@ import itertools
 import multiprocessing as _mp
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
@@ -62,6 +62,22 @@ def set_path(obj: Any, path: str, value: Any) -> Any:
                 return type(node)(items) if isinstance(node, tuple) else items
             if not hasattr(node, head):
                 raise ConfigError(f"{type(node).__name__} has no field {head!r}.")
+            if is_dataclass(node) and head not in {f.name for f in fields(node)}:
+                # a read-only property (a brushless machine's kt/kv/resistance are
+                # derived from its dq spec) would otherwise die inside replace()
+                # with "__init__() got an unexpected keyword argument"
+                kind = type(node).__name__
+                names = ", ".join(sorted(f.name for f in fields(node)))
+                where = ".".join(parts[:-1]) or type(node).__name__
+                extra = ""
+                spec = getattr(node, "spec", None)
+                if is_dataclass(spec):
+                    spec_names = ", ".join(sorted(f.name for f in fields(spec)))
+                    extra = f" The constants live under {where}.spec.* ({spec_names})."
+                raise ConfigError(
+                    f"{kind}.{head} is derived, not a field, so it cannot be set. "
+                    f"{kind} has fields {names}.{extra}"
+                )
             return replace(node, **{head: value})
         child = node[head] if isinstance(node, (list, tuple)) else getattr(node, head)
         new_child = walk(child, tuple(rest))

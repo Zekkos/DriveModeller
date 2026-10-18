@@ -17,7 +17,7 @@ Two load flavours:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -39,6 +39,9 @@ class Wheel:
             raise ConfigError("Wheel mass must be >= 0.")
         if self.inertia_factor < 0:
             raise ConfigError("Wheel inertia factor must be >= 0.")
+
+    def copy(self) -> Wheel:
+        return replace(self)
 
     @property
     def inertia(self) -> float:

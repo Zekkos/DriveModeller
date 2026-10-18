@@ -6,3 +6,5 @@ __pycache__/
 *.png
 .venv/
 venv/
+# default `export --out` target: generated code, not source
+build/

@@ -332,7 +332,12 @@ def _enrich(result: SimulationResult, system: DriveSystem) -> SimulationResult:
     gb = system.gearbox
     dt = float(result.t[1] - result.t[0]) if len(result.t) > 1 else 0.0
     result.output_speed = result.motor_speed * gb.ratio
-    result.power_out = result.torque * result.output_speed * gb.efficiency
+    # Torque here is motor-shaft torque, so the power has to be taken at the
+    # motor speed: the gearbox trades torque for speed and the ratio cancels
+    # (tau_out = tau * efficiency / ratio, omega_out = omega * ratio), which
+    # leaves tau * omega * efficiency.  Multiplying motor torque by output speed
+    # under-reports a reducer by its ratio and over-reports a multiplier.
+    result.power_out = result.torque * result.motor_speed * gb.efficiency
     result.power_in = result.voltage * result.current
     r = system.group.motor.resistance / system.group.count
     result.copper_loss = result.current**2 * r
